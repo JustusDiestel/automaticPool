@@ -1,0 +1,162 @@
+import subprocess
+import time
+from datetime import datetime
+
+POOL_NAME = "mypool"
+MOUNTPOINT = "/mnt/draidBenchmark"
+
+def run_cmd(cmd, check=True):
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if check and result.returncode != 0:
+        print(f"[FEHLER] Befehl fehlgeschlagen: {cmd}")
+        print(result.stderr)
+        raise Exception("Fehler bei Kommandoausführung")
+    return result.stdout.strip()
+
+def get_valid_disk_paths():
+    """
+    Gibt gültige WWN-basierten Pfade zurück: /dev/disk/by-id/wwn-0x...
+    Nur wenn Logical Unit ID 18 Zeichen lang ist.
+    """
+    cmd = r'''
+    for dev in /dev/sd*; do
+        [[ "$dev" =~ [0-9] ]] && continue
+        id=$(smartctl -i "$dev" 2>/dev/null | grep 'Logical Unit id' | awk '{print $4}')
+        if [[ ${#id} -eq 18 ]]; then
+            for path in /dev/disk/by-id/wwn-*; do
+                if [[ "$(readlink -f "$path")" == "$(readlink -f "$dev")" ]]; then
+                    echo "$path"
+                    break
+                fi
+            done
+        fi
+    done
+    '''
+    result = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+    if result.returncode != 0:
+        print("Fehler beim Abrufen der Pfade:")
+        print(result.stderr)
+        return []
+    return result.stdout.strip().splitlines()
+
+def generate_draid2_configs(dev_paths, min_children=4):
+    total_disks = len(dev_paths) - 1  # eine als Ersatz frei lassen
+    configs = []
+
+    for vdevs in range(1, total_disks + 1):
+        if total_disks % vdevs != 0:
+            continue
+
+        children = total_disks // vdevs
+        if children < min_children:
+            continue
+
+        spares = 1
+        parity = 2
+        data = children - parity - spares
+        if data < 1:
+            continue
+
+        vdev_config = f"draid2:{data}d:{spares}s:{children}c"
+        vdev_parts = []
+        for i in range(vdevs):
+            start = i * children
+            end = start + children
+            vdev_devs = " ".join(dev_paths[start:end])
+            vdev_parts.append(f"{vdev_config} {vdev_devs}")
+
+        # Deine gewünschte ZFS-Konfiguration
+        zpool_cmd = (
+            f"zpool create -f -m {MOUNTPOINT} -o ashift=12 {POOL_NAME} \\\n  "
+            + " \\\n  ".join(vdev_parts)
+        )
+
+        configs.append({
+            "vdevs": vdevs,
+            "children": children,
+            "spares": spares,
+            "parity": parity,
+            "data": data,
+            "zfs_syntax": vdev_config,
+            "zpool_create_cmd": zpool_cmd,
+            "used_disks": dev_paths[:total_disks],
+            "spare_disk": dev_paths[total_disks]
+        })
+
+    return configs
+
+def create_pool(pool_cmd):
+    print("[INFO] Erstelle Pool...")
+    run_cmd(pool_cmd)
+    print("[INFO] Deaktiviere Kompression...")
+    run_cmd(f"zfs set compression=off {POOL_NAME}")
+
+def simulate_resilver(pool_name, used_disks, spare_disk):
+    failed_path = used_disks[0]
+    replacement_path = spare_disk
+
+    print(f"[INFO] Nehme Disk offline: {failed_path}")
+    run_cmd(f"zpool offline {pool_name} {failed_path}")
+    time.sleep(1)
+
+    print(f"[INFO] Ersetze durch Ersatz-Disk: {replacement_path}")
+    run_cmd(f"zpool replace {pool_name} {failed_path} {replacement_path}")
+    time.sleep(2)
+
+    print("[INFO] Warte auf Resilvering...")
+    start_time = time.time()
+    while True:
+        status = run_cmd(f"zpool status {pool_name}", check=False)
+        if "resilver in progress" in status:
+            time.sleep(2)
+        else:
+            break
+    end_time = time.time()
+    duration = end_time - start_time
+
+    return duration, status
+
+def delete_pool(pool_name):
+    print("[INFO] Lösche Pool...")
+    run_cmd("pkill -9 fio", check=False)
+    run_cmd("fuser -k /mnt/draidBenchmark", check=False)
+    run_cmd("umount -f /mnt/draidBenchmark", check=False)
+    run_cmd(f"zpool destroy {pool_name}")
+
+def main():
+    dev_paths = get_valid_disk_paths()
+    if len(dev_paths) < 5:
+        print("Nicht genug gültige Disks gefunden!")
+        return
+
+    configs = generate_draid2_configs(dev_paths)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    logfile = f"resilver_tests_{timestamp}.log"
+
+    for i, cfg in enumerate(configs):
+        print(f"\n[TEST {i+1}/{len(configs)}] Konfiguration: {cfg['zfs_syntax']}")
+        try:
+            create_pool(cfg["zpool_create_cmd"])
+            duration, status = simulate_resilver(POOL_NAME, cfg["used_disks"], cfg["spare_disk"])
+            delete_pool(POOL_NAME)
+
+            with open(logfile, "a") as f:
+                f.write(f"--- Test {i+1} ---\n")
+                f.write(f"Konfiguration: {cfg['zfs_syntax']}\n")
+                f.write(f"VDEVs: {cfg['vdevs']}, Data: {cfg['data']}, Children: {cfg['children']}\n")
+                f.write(f"Resilver-Zeit: {duration:.2f} Sekunden\n")
+                f.write(status + "\n\n")
+
+        except Exception as e:
+            print(f"[FEHLER] Test fehlgeschlagen: {e}")
+            try:
+                delete_pool(POOL_NAME)
+            except:
+                pass
+            continue
+
+    print(f"\n✅ Alle Tests abgeschlossen. Ergebnisse gespeichert in: {logfile}")
+
+
+if __name__ == "__main__":
+    main()
