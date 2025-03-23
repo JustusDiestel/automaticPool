@@ -48,7 +48,7 @@ def generate_draid2_configs(disk_ids, min_children=4):
         if data < 1:
             continue
 
-        vdev_config = f"draid2:{children}:{spares}:{data}"
+        vdev_config = f"draid2:{data}d:{spares}s:{children}c"
         vdev_parts = []
         for i in range(vdevs):
             start = i * children
