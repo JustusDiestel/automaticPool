@@ -2,9 +2,7 @@ import subprocess
 import time
 from datetime import datetime
 
-
 POOL_NAME = "mypool"
-
 
 def run_cmd(cmd, check=True):
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
@@ -13,33 +11,6 @@ def run_cmd(cmd, check=True):
         print(result.stderr)
         raise Exception("Fehler bei Kommandoausführung")
     return result.stdout.strip()
-
-
-def create_pool(pool_cmd):
-    print(f"[INFO] Erstelle Pool:\n{pool_cmd}")
-    run_cmd(pool_cmd)
-
-
-def simulate_resilver(pool_name):
-    print("[INFO] Starte Resilver-Simulation (Scrub)...")
-    run_cmd(f"zpool scrub {pool_name}")
-    time.sleep(5)  # optional: gib dem Scrub etwas Zeit
-
-    print("[INFO] Warte auf Scrub-Ende...")
-    while True:
-        status = run_cmd(f"zpool status {pool_name}")
-        if "scrub in progress" in status:
-            time.sleep(2)
-        else:
-            break
-
-    return status
-
-
-def delete_pool(pool_name):
-    print(f"[INFO] Pool {pool_name} wird gelöscht...")
-    run_cmd(f"zpool destroy {pool_name}")
-
 
 def get_valid_disk_ids():
     cmd = r'''
@@ -58,9 +29,8 @@ def get_valid_disk_ids():
         return []
     return result.stdout.strip().splitlines()
 
-
 def generate_draid2_configs(disk_ids, min_children=4):
-    total_disks = len(disk_ids)
+    total_disks = len(disk_ids) - 1  # Eine als Ersatz freihalten!
     configs = []
 
     for vdevs in range(1, total_disks + 1):
@@ -77,14 +47,12 @@ def generate_draid2_configs(disk_ids, min_children=4):
         if data < 1:
             continue
 
-        rg_possible = [i for i in range(1, data + 1) if data % i == 0]
         vdev_config = f"draid2:{children}:{spares}:{data}"
         vdev_parts = []
-
         for i in range(vdevs):
             start = i * children
             end = start + children
-            vdev_devs = " ".join(f"/dev/disk/by-id/{id_}" for id_ in disk_ids[start:end])
+            vdev_devs = " ".join(f"/dev/disk/by-id/{disk_ids[j]}" for j in range(start, end))
             vdev_parts.append(f"{vdev_config} {vdev_devs}")
 
         zpool_cmd = f"zpool create {POOL_NAME} \\\n  " + " \\\n  ".join(vdev_parts)
@@ -92,41 +60,81 @@ def generate_draid2_configs(disk_ids, min_children=4):
         configs.append({
             "vdevs": vdevs,
             "children": children,
-            "spares_per_vdev": spares,
+            "spares": spares,
             "parity": parity,
             "data": data,
-            "redundancy_groups": rg_possible,
             "zfs_syntax": vdev_config,
-            "zpool_create_cmd": zpool_cmd
+            "zpool_create_cmd": zpool_cmd,
+            "used_disks": disk_ids[:total_disks],
+            "spare_disk": disk_ids[total_disks]  # Reserve-Disk
         })
 
     return configs
 
+def create_pool(pool_cmd):
+    print("[INFO] Erstelle Pool...")
+    run_cmd(pool_cmd)
+
+def simulate_resilver(pool_name, used_disks, spare_disk):
+    failed_disk = used_disks[0]
+    failed_path = f"/dev/disk/by-id/{failed_disk}"
+    replacement_path = f"/dev/disk/by-id/{spare_disk}"
+
+    print(f"[INFO] Nehme Disk offline: {failed_path}")
+    run_cmd(f"zpool offline {pool_name} {failed_path}")
+    time.sleep(1)
+
+    print(f"[INFO] Ersetze durch Ersatz-Disk: {replacement_path}")
+    run_cmd(f"zpool replace {pool_name} {failed_path} {replacement_path}")
+    time.sleep(2)
+
+    print("[INFO] Warte auf Resilvering...")
+    start_time = time.time()
+    while True:
+        status = run_cmd(f"zpool status {pool_name}", check=False)
+        if "resilver in progress" in status:
+            time.sleep(2)
+        else:
+            break
+    end_time = time.time()
+    duration = end_time - start_time
+
+    return duration, status
+
+def delete_pool(pool_name):
+    print("[INFO] Lösche Pool...")
+    run_cmd(f"zpool destroy {pool_name}")
 
 def main():
     disk_ids = get_valid_disk_ids()
-    if not disk_ids:
-        print("Keine gültigen Disks gefunden.")
+    if len(disk_ids) < 5:
+        print("Nicht genug Disks verfügbar!")
         return
 
     configs = generate_draid2_configs(disk_ids)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    logfile = f"resilver_results_{timestamp}.log"
+    logfile = f"resilver_tests_{timestamp}.log"
 
     for i, cfg in enumerate(configs):
-        print(f"\n[TEST {i+1}/{len(configs)}] Konfiguration: {cfg['zfs_syntax']}")
+        print(f"\n[TEST {i+1}/{len(configs)}] {cfg['zfs_syntax']}")
         try:
             create_pool(cfg["zpool_create_cmd"])
-            result = simulate_resilver(POOL_NAME)
+            duration, status = simulate_resilver(POOL_NAME, cfg["used_disks"], cfg["spare_disk"])
             delete_pool(POOL_NAME)
 
             with open(logfile, "a") as f:
-                f.write(f"--- TEST {i+1} ---\n")
+                f.write(f"--- Test {i+1} ---\n")
                 f.write(f"Konfiguration: {cfg['zfs_syntax']}\n")
-                f.write(result + "\n\n")
+                f.write(f"VDEVs: {cfg['vdevs']}, Data: {cfg['data']}, Children: {cfg['children']}\n")
+                f.write(f"Resilver-Zeit: {duration:.2f} Sekunden\n")
+                f.write(status + "\n\n")
 
         except Exception as e:
-            print(f"[WARNUNG] Test fehlgeschlagen: {e}")
+            print(f"[FEHLER] Test abgebrochen: {e}")
+            try:
+                delete_pool(POOL_NAME)
+            except:
+                pass
             continue
 
     print(f"\n✅ Alle Tests abgeschlossen. Ergebnisse in {logfile}")
@@ -134,3 +142,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
