@@ -2,7 +2,8 @@ import subprocess
 import time
 from datetime import datetime
 
-POOL_NAME = "mypool"
+POOL_NAME = "dRAID2"
+MOUNTPOINT = "/mnt/draidBenchmark"
 
 def run_cmd(cmd, check=True):
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
@@ -30,7 +31,7 @@ def get_valid_disk_ids():
     return result.stdout.strip().splitlines()
 
 def generate_draid2_configs(disk_ids, min_children=4):
-    total_disks = len(disk_ids) - 1  # Eine als Ersatz freihalten!
+    total_disks = len(disk_ids) - 1  # Eine als Ersatz frei lassen
     configs = []
 
     for vdevs in range(1, total_disks + 1):
@@ -55,7 +56,10 @@ def generate_draid2_configs(disk_ids, min_children=4):
             vdev_devs = " ".join(f"/dev/disk/by-id/{disk_ids[j]}" for j in range(start, end))
             vdev_parts.append(f"{vdev_config} {vdev_devs}")
 
-        zpool_cmd = f"zpool create {POOL_NAME} \\\n  " + " \\\n  ".join(vdev_parts)
+        zpool_cmd = (
+            f"zpool create -f -m {MOUNTPOINT} -o ashift=12 {POOL_NAME} \\\n  "
+            + " \\\n  ".join(vdev_parts)
+        )
 
         configs.append({
             "vdevs": vdevs,
@@ -66,14 +70,16 @@ def generate_draid2_configs(disk_ids, min_children=4):
             "zfs_syntax": vdev_config,
             "zpool_create_cmd": zpool_cmd,
             "used_disks": disk_ids[:total_disks],
-            "spare_disk": disk_ids[total_disks]  # Reserve-Disk
+            "spare_disk": disk_ids[total_disks]
         })
 
     return configs
 
 def create_pool(pool_cmd):
-    print("[INFO] Erstelle Pool...")
+    print("[INFO] Erstelle ZFS-Pool...")
     run_cmd(pool_cmd)
+    print("[INFO] Deaktiviere ZFS-Kompression...")
+    run_cmd(f"zfs set compression=off {POOL_NAME}")
 
 def simulate_resilver(pool_name, used_disks, spare_disk):
     failed_disk = used_disks[0]
@@ -84,7 +90,7 @@ def simulate_resilver(pool_name, used_disks, spare_disk):
     run_cmd(f"zpool offline {pool_name} {failed_path}")
     time.sleep(1)
 
-    print(f"[INFO] Ersetze durch Ersatz-Disk: {replacement_path}")
+    print(f"[INFO] Ersetze durch Ersatzdisk: {replacement_path}")
     run_cmd(f"zpool replace {pool_name} {failed_path} {replacement_path}")
     time.sleep(2)
 
@@ -102,44 +108,43 @@ def simulate_resilver(pool_name, used_disks, spare_disk):
     return duration, status
 
 def delete_pool(pool_name):
-    print("[INFO] Lösche Pool...")
+    print("[INFO] Zerstöre Pool...")
     run_cmd(f"zpool destroy {pool_name}")
 
 def main():
     disk_ids = get_valid_disk_ids()
     if len(disk_ids) < 5:
-        print("Nicht genug Disks verfügbar!")
+        print("Nicht genug Disks gefunden!")
         return
 
     configs = generate_draid2_configs(disk_ids)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    logfile = f"resilver_tests_{timestamp}.log"
+    logfile = f"resilver_results_{timestamp}.log"
 
     for i, cfg in enumerate(configs):
-        print(f"\n[TEST {i+1}/{len(configs)}] {cfg['zfs_syntax']}")
+        print(f"\n[TEST {i+1}/{len(configs)}] Konfiguration: {cfg['zfs_syntax']}")
         try:
             create_pool(cfg["zpool_create_cmd"])
             duration, status = simulate_resilver(POOL_NAME, cfg["used_disks"], cfg["spare_disk"])
             delete_pool(POOL_NAME)
 
             with open(logfile, "a") as f:
-                f.write(f"--- Test {i+1} ---\n")
+                f.write(f"--- TEST {i+1} ---\n")
                 f.write(f"Konfiguration: {cfg['zfs_syntax']}\n")
                 f.write(f"VDEVs: {cfg['vdevs']}, Data: {cfg['data']}, Children: {cfg['children']}\n")
                 f.write(f"Resilver-Zeit: {duration:.2f} Sekunden\n")
                 f.write(status + "\n\n")
 
         except Exception as e:
-            print(f"[FEHLER] Test abgebrochen: {e}")
+            print(f"[FEHLER] Test fehlgeschlagen: {e}")
             try:
                 delete_pool(POOL_NAME)
             except:
                 pass
             continue
 
-    print(f"\n✅ Alle Tests abgeschlossen. Ergebnisse in {logfile}")
+    print(f"\n✅ Alle Tests abgeschlossen. Ergebnisse gespeichert in: {logfile}")
 
 
 if __name__ == "__main__":
     main()
-
